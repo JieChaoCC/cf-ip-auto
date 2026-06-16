@@ -1,4 +1,4 @@
-name: CF IP Auto Update (Best Port Selection)
+name: CF IP Auto Update (Top 5 per Country)
 
 on:
   schedule:
@@ -23,7 +23,7 @@ jobs:
         H=$(date -u +"%H")
         if [ "$H" = "00" ]; then echo "reset=true" >> $GITHUB_OUTPUT; else echo "reset=false" >> $GITHUB_OUTPUT; fi
 
-    - name: Fetch / Best Port Selection / Append / Sort
+    - name: Fetch / Best Port / Top 5 per Country
       run: |
         set -e
         mkdir -p data
@@ -42,10 +42,10 @@ jobs:
         fi
 
         # ==========================================================
-        # A. 存量 IP：重新评估最优端口（自动剔除失效）
+        # A. 存量 IP：重新评估最优端口 + 延迟
         # ==========================================================
         if [ -s "$OUT" ]; then
-          echo "🩺 存量 IP 最优端口重选..."
+          echo "🩺 存量 IP 重选最优端口..."
           TMP_KEEP=""
           while IFS= read -r line; do
             ip=$(echo "$line" | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}')
@@ -56,22 +56,16 @@ jobs:
 
             for port in "${PORTS[@]}"; do
               start=$(date +%s%3N)
-              ok=0
-
-              # TLS + trace
               resp=$(curl -sk --connect-timeout 3 --max-time 6 \
                 --resolve "$TRACE_HOST:$port:$ip" \
                 "https://$TRACE_HOST:$port/cdn-cgi/trace" 2>/dev/null)
-
               if echo "$resp" | grep -qi '^colo='; then
                 end=$(date +%s%3N)
                 rt=$((end-start))
-                ok=1
-              fi
-
-              if [ "$ok" -eq 1 ] && [ "$rt" -lt "$best_time" ]; then
-                best_time=$rt
-                best_port=$port
+                if [ "$rt" -lt "$best_time" ]; then
+                  best_time=$rt
+                  best_port=$port
+                fi
               fi
             done
 
@@ -92,21 +86,21 @@ jobs:
               fi
             fi
 
-            # 成功：重置计数，写回最优端口
             awk -v i="$ip" '$1!=i' "$FC" > /tmp/_fc.txt && mv /tmp/_fc.txt "$FC"
 
-            country=$(echo "$line" | sed -E 's/.*#//')
-            TMP_KEEP="${TMP_KEEP}${ip}:${best_port}#${country}"$'\n'
+            # 提取国家
+            country=$(echo "$line" | sed -E 's/.*#//' | sed 's/([0-9]*ms)//g')
+            TMP_KEEP="${TMP_KEEP}${ip}:${best_port}#${country}#${best_time}"$'\n'
             echo "  ✅ $ip 最优端口：$best_port (${best_time}ms)"
           done <<< "$(cat "$OUT")"
 
           printf '%s' "$TMP_KEEP" | grep -xE '.+' > /tmp/out_clean.txt
           mv /tmp/out_clean.txt "$OUT"
-          echo "✅ 存量重选完成，剩余 $(grep -c '^[0-9]' "$OUT") 条"
+          echo "✅ 存量重选完成"
         fi
 
         # ==========================================================
-        # B. 新 IP：选最优端口 + iplark 归属
+        # B. 新 IP：最优端口 + 双重归属查询
         # ==========================================================
         echo "📡 抓取新 IP：$LIST_URL"
         curl -s --connect-timeout 15 --max-time 30 "$LIST_URL" \
@@ -150,32 +144,95 @@ jobs:
           fi
 
           echo "  🆕 归属查询：$ip"
+          
+          # ✅ 双重归属查询（解决未知地区）
+          COUNTRY=""
+          
+          # 1. 先试 iplark.com
           COUNTRY=$(curl -s --connect-timeout 8 --max-time 10 "https://iplark.com/?q=$ip" \
             | grep -oE '国家[:：]\s*[^\s<]+' | head -1 | sed -E 's/国家[:：]\s*//' | tr -d ' ')
-
+          
+          # 2. 如果失败，用 ip-api.com（更稳定）
+          if [ -z "$COUNTRY" ] || [ "$COUNTRY" = "未知地区" ]; then
+            COUNTRY=$(curl -s --connect-timeout 8 --max-time 10 "http://ip-api.com/json/$ip?fields=country" \
+              | grep -oE '"country":"[^"]+"' | cut -d'"' -f4)
+          fi
+          
+          # 3. 如果还是失败，用 ipwhois.io
+          if [ -z "$COUNTRY" ]; then
+            COUNTRY=$(curl -s --connect-timeout 8 --max-time 10 "https://ipwhois.app/json/$ip" \
+              | grep -oE '"country":"[^"]+"' | cut -d'"' -f4)
+          fi
+          
           COUNTRY=${COUNTRY:-未知地区}
-          echo "$ip:${best_port}#$COUNTRY" >> "$OUT"
+          
+          # 清理国家名称
+          case "$COUNTRY" in
+            "China") COUNTRY="中国" ;;
+            "Hong Kong") COUNTRY="中国香港" ;;
+            "Taiwan") COUNTRY="中国台湾" ;;
+            "Macau") COUNTRY="中国澳门" ;;
+            "United States") COUNTRY="美国" ;;
+            "Japan") COUNTRY="日本" ;;
+            "South Korea") COUNTRY="韩国" ;;
+            "Singapore") COUNTRY="新加坡" ;;
+            "Germany") COUNTRY="德国" ;;
+            "France") COUNTRY="法国" ;;
+            "United Kingdom") COUNTRY="英国" ;;
+          esac
+
+          echo "$ip:${best_port}#${COUNTRY}#${best_time}" >> "$OUT"
           echo "$ip" >> /tmp/existing_ips.txt
           NEW=$((NEW+1))
-          echo "     → 选定端口 ${best_port} (${best_time}ms)"
+          echo "     → 选定端口 ${best_port} (${best_time}ms) | 归属：$COUNTRY"
           sleep 1
         done < /tmp/latest_ips.txt
 
         echo "✏️  追加新 IP：$NEW"
 
         # ==========================================================
-        # C. 排序（中国优先）
+        # C. 每个国家只保留延迟最低的前 5 个
         # ==========================================================
+        echo "🎯 每个国家只保留延迟最低的前 5 个..."
+        
+        # 创建临时文件存储处理后的数据
+        > /tmp/top5_per_country.txt
+        
+        # 定义国家优先级顺序
+        COUNTRIES=("中国" "中国香港" "中国台湾" "中国澳门" "美国" "日本" "韩国" "新加坡" "德国" "法国" "英国")
+        
+        for country in "${COUNTRIES[@]}"; do
+          echo "  处理国家：$country"
+          grep "#${country}#" "$OUT" | sort -t'#' -k3 -n | head -5 >> /tmp/top5_per_country.txt
+        done
+        
+        # 处理其他国家（不在预定义列表中的）
+        grep -v -E "#(中国|中国香港|中国台湾|中国澳门|美国|日本|韩国|新加坡|德国|法国|英国)#" "$OUT" \
+        | sort -t'#' -k3 -n | head -5 >> /tmp/top5_per_country.txt
+        
+        # 如果没有任何匹配，保留原始文件
+        if [ -s /tmp/top5_per_country.txt ]; then
+          mv /tmp/top5_per_country.txt "$OUT"
+        fi
+
+        # ==========================================================
+        # D. 最终排序 + 清理格式（去掉延迟）
+        # ==========================================================
+        echo "🧮 最终排序..."
+        
         (
-          grep -E '#(中国|香港|台湾|澳门)' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n
-          grep -E '#美国' "$OUT"             | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n
-          grep -E '#日本' "$OUT"             | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n
-          grep -E '#韩国' "$OUT"             | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n
-          grep -E '#新加坡' "$OUT"           | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n
-          grep -v -E '#(中国|香港|台湾|澳门|美国|日本|韩国|新加坡)' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n
+          grep -E '#(中国|中国香港|中国台湾|中国澳门)#' "$OUT" | sort -t'#' -k3 -n
+          grep -E '#美国#' "$OUT" | sort -t'#' -k3 -n
+          grep -E '#日本#' "$OUT" | sort -t'#' -k3 -n
+          grep -E '#韩国#' "$OUT" | sort -t'#' -k3 -n
+          grep -E '#新加坡#' "$OUT" | sort -t'#' -k3 -n
+          grep -E '#(德国|法国|英国)#' "$OUT" | sort -t'#' -k3 -n
+          grep -v -E '#(中国|中国香港|中国台湾|中国澳门|美国|日本|韩国|新加坡|德国|法国|英国)#' "$OUT" | sort -t'#' -k3 -n
         ) > /tmp/ipapi_sorted.txt
 
-        mv /tmp/ipapi_sorted.txt "$OUT"
+        # ✅ 清理格式：去掉延迟部分
+        sed -E 's/#([^#]+)#[0-9]+$/#\1/' /tmp/ipapi_sorted.txt > "$OUT"
+
         echo "📦 最终 IP 数：$(grep -c '^[0-9]' "$OUT")"
 
     - name: Commit & Push
