@@ -1,4 +1,4 @@
-name: CF IP Auto Update + PoP
+name: CF IP Auto Update (Best Port Selection)
 
 on:
   schedule:
@@ -15,20 +15,15 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v5
+    - uses: actions/checkout@v5
 
     - name: Daily Reset Check
       id: reset
       run: |
-        HOUR=$(date -u +"%H")
-        if [ "$HOUR" = "00" ]; then
-          echo "reset=true" >> $GITHUB_OUTPUT
-        else
-          echo "reset=false" >> $GITHUB_OUTPUT
-        fi
+        H=$(date -u +"%H")
+        if [ "$H" = "00" ]; then echo "reset=true" >> $GITHUB_OUTPUT; else echo "reset=false" >> $GITHUB_OUTPUT; fi
 
-    - name: Fetch IPs & Detect PoP
+    - name: Fetch / Best Port Selection / Append / Sort
       run: |
         set -e
         mkdir -p data
@@ -36,73 +31,152 @@ jobs:
         LIST_URL="https://ip.164746.xyz/"
         TRACE_HOST="cs.891122.xyz"
         OUT="data/ipapi.txt"
+        FC="data/_failcount.txt"
+        PORTS=(443 2053 2083 2087 2096 8443)
+        touch "$FC"
 
         if [ "${{ steps.reset.outputs.reset }}" = "true" ]; then
-          echo "🌅 每日首次，清空 ipapi.txt"
+          echo "🌅 每日首次(UTC 00:00)：清空"
           > "$OUT"
+          > "$FC"
         fi
 
-        echo "📡 抓取 IP 列表..."
+        # ==========================================================
+        # A. 存量 IP：重新评估最优端口（自动剔除失效）
+        # ==========================================================
+        if [ -s "$OUT" ]; then
+          echo "🩺 存量 IP 最优端口重选..."
+          TMP_KEEP=""
+          while IFS= read -r line; do
+            ip=$(echo "$line" | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}')
+            [ -z "$ip" ] && { TMP_KEEP="${TMP_KEEP}${line}"$'\n'; continue; }
+
+            best_port=""
+            best_time=999
+
+            for port in "${PORTS[@]}"; do
+              start=$(date +%s%3N)
+              ok=0
+
+              # TLS + trace
+              resp=$(curl -sk --connect-timeout 3 --max-time 6 \
+                --resolve "$TRACE_HOST:$port:$ip" \
+                "https://$TRACE_HOST:$port/cdn-cgi/trace" 2>/dev/null)
+
+              if echo "$resp" | grep -qi '^colo='; then
+                end=$(date +%s%3N)
+                rt=$((end-start))
+                ok=1
+              fi
+
+              if [ "$ok" -eq 1 ] && [ "$rt" -lt "$best_time" ]; then
+                best_time=$rt
+                best_port=$port
+              fi
+            done
+
+            if [ -z "$best_port" ]; then
+              old=$(awk -v i="$ip" '$1==i{print $2}' "$FC" || true)
+              old=${old:-0}
+              new=$((old+1))
+              echo "  ❌ $ip 所有端口失效 (连续 $new/3)"
+              if [ "$new" -ge 3 ]; then
+                echo "  🗑  剔除 $ip"
+                awk -v i="$ip" '$1!=i' "$FC" > /tmp/_fc.txt && mv /tmp/_fc.txt "$FC"
+                continue
+              else
+                grep -v "^$ip " "$FC" > /tmp/_fc.txt
+                echo "$ip $new" >> /tmp/_fc.txt
+                mv /tmp/_fc.txt "$FC"
+                continue
+              fi
+            fi
+
+            # 成功：重置计数，写回最优端口
+            awk -v i="$ip" '$1!=i' "$FC" > /tmp/_fc.txt && mv /tmp/_fc.txt "$FC"
+
+            country=$(echo "$line" | sed -E 's/.*#//')
+            TMP_KEEP="${TMP_KEEP}${ip}:${best_port}#${country}"$'\n'
+            echo "  ✅ $ip 最优端口：$best_port (${best_time}ms)"
+          done <<< "$(cat "$OUT")"
+
+          printf '%s' "$TMP_KEEP" | grep -xE '.+' > /tmp/out_clean.txt
+          mv /tmp/out_clean.txt "$OUT"
+          echo "✅ 存量重选完成，剩余 $(grep -c '^[0-9]' "$OUT") 条"
+        fi
+
+        # ==========================================================
+        # B. 新 IP：选最优端口 + iplark 归属
+        # ==========================================================
+        echo "📡 抓取新 IP：$LIST_URL"
         curl -s --connect-timeout 15 --max-time 30 "$LIST_URL" \
         | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
         | sort -u > /tmp/latest_ips.txt
 
-        echo "📋 本轮 IP 数：$(wc -l < /tmp/latest_ips.txt)"
+        echo "📋 本轮候选 IP 数：$(wc -l < /tmp/latest_ips.txt)"
 
         touch "$OUT"
         grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}' "$OUT" | sort -u > /tmp/existing_ips.txt
 
-        NEW_COUNT=0
-        > /tmp/ipapi_append.txt
-
+        NEW=0
         while read ip; do
+          [ -z "$ip" ] && continue
           if grep -qx "$ip" /tmp/existing_ips.txt; then
             echo "  ⏭ $ip 已存在"
             continue
           fi
 
-          echo "  🔍 $ip"
-          POP="UNKNOWN"
+          best_port=""
+          best_time=999
 
-          COL=$(curl -s --connect-timeout 4 --max-time 6 \
-            -H "Host: $TRACE_HOST" \
-            "http://$ip/cdn-cgi/trace" 2>/dev/null \
-            | grep -i '^colo=' | cut -d'=' -f2)
+          for port in "${PORTS[@]}"; do
+            start=$(date +%s%3N)
+            resp=$(curl -sk --connect-timeout 3 --max-time 6 \
+              --resolve "$TRACE_HOST:$port:$ip" \
+              "https://$TRACE_HOST:$port/cdn-cgi/trace" 2>/dev/null)
+            if echo "$resp" | grep -qi '^colo='; then
+              end=$(date +%s%3N)
+              rt=$((end-start))
+              if [ "$rt" -lt "$best_time" ]; then
+                best_time=$rt
+                best_port=$port
+              fi
+            fi
+          done
 
-          if [ -z "$COL" ]; then
-            COL=$(curl -sk --connect-timeout 4 --max-time 6 \
-              --resolve "$TRACE_HOST:443:$ip" \
-              "https://$TRACE_HOST/cdn-cgi/trace" 2>/dev/null \
-              | grep -i '^colo=' | cut -d'=' -f2)
+          if [ -z "$best_port" ]; then
+            echo "  ⚠️  $ip 所有端口不可用，跳过"
+            continue
           fi
 
-          [ -n "$COL" ] && POP="$COL"
-          echo "$ip:443#CF-$POP" >> /tmp/ipapi_append.txt
+          echo "  🆕 归属查询：$ip"
+          COUNTRY=$(curl -s --connect-timeout 8 --max-time 10 "https://iplark.com/?q=$ip" \
+            | grep -oE '国家[:：]\s*[^\s<]+' | head -1 | sed -E 's/国家[:：]\s*//' | tr -d ' ')
+
+          COUNTRY=${COUNTRY:-未知地区}
+          echo "$ip:${best_port}#$COUNTRY" >> "$OUT"
           echo "$ip" >> /tmp/existing_ips.txt
-          NEW_COUNT=$((NEW_COUNT+1))
+          NEW=$((NEW+1))
+          echo "     → 选定端口 ${best_port} (${best_time}ms)"
+          sleep 1
         done < /tmp/latest_ips.txt
 
-        if [ "$NEW_COUNT" -gt 0 ]; then
-          cat /tmp/ipapi_append.txt >> "$OUT"
-        fi
+        echo "✏️  追加新 IP：$NEW"
 
-        echo "🧮 排序并添加中文地区标注..."
-
-        # ✅ 排序 + 中文地区标注
+        # ==========================================================
+        # C. 排序（中国优先）
+        # ==========================================================
         (
-          grep '#CF-LAX' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-LAX/#CF-LAX(美国洛杉矶)/g'
-          grep '#CF-SJC' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-SJC/#CF-SJC(美国圣何塞)/g'
-          grep '#CF-EWR' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-EWR/#CF-EWR(美国纽瓦克)/g'
-          grep '#CF-IAD' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-IAD/#CF-IAD(美国阿什本)/g'
-          grep '#CF-HKG' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-HKG/#CF-HKG(中国香港)/g'
-          grep '#CF-NRT' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-NRT/#CF-NRT(日本东京)/g'
-          grep '#CF-SIN' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-SIN/#CF-SIN(新加坡)/g'
-          grep -v '#CF-\(LAX\|SJC\|EWR\|IAD\|HKG\|NRT\|SIN\)' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-UNKNOWN/#CF-UNKNOWN(未知地区)/g'
-        ) > /tmp/ipapi_final.txt
+          grep -E '#(中国|香港|台湾|澳门)' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n
+          grep -E '#美国' "$OUT"             | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n
+          grep -E '#日本' "$OUT"             | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n
+          grep -E '#韩国' "$OUT"             | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n
+          grep -E '#新加坡' "$OUT"           | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n
+          grep -v -E '#(中国|香港|台湾|澳门|美国|日本|韩国|新加坡)' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n
+        ) > /tmp/ipapi_sorted.txt
 
-        mv /tmp/ipapi_final.txt "$OUT"
-
-        echo "✅ 完成，当前 IP 数：$(grep -c '^[0-9]' "$OUT")"
+        mv /tmp/ipapi_sorted.txt "$OUT"
+        echo "📦 最终 IP 数：$(grep -c '^[0-9]' "$OUT")"
 
     - name: Commit & Push
       run: |
