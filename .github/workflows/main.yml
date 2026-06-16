@@ -2,7 +2,6 @@ name: CF IP Auto Update + PoP
 
 on:
   schedule:
-    # 每 2 小时运行一次（UTC 时间）
     - cron: '0 */2 * * *'
   workflow_dispatch:
 
@@ -19,8 +18,8 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v5
 
-    - name: Decide Reset or Append
-      id: reset_check
+    - name: Determine if Daily Reset
+      id: reset
       run: |
         HOUR=$(date -u +"%H")
         if [ "$HOUR" = "00" ]; then
@@ -37,9 +36,9 @@ jobs:
         DOMAIN="cs.891122.xyz"
         OUT="data/ipapi.txt"
 
-        # 每天 00:00 UTC 清空历史
-        if [ "${{ steps.reset_check.outputs.reset }}" = "true" ]; then
-          echo "🌅 每日首次运行，清空历史记录"
+        # ✅ 每天 00:00 UTC 清空（只在 reset=true 时）
+        if [ "${{ steps.reset.outputs.reset }}" = "true" ]; then
+          echo "🌅 每日首次运行，清空 ipapi.txt"
           > "$OUT"
         fi
 
@@ -48,9 +47,15 @@ jobs:
         | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
         | sort -u > /tmp/latest_ips.txt
 
-        echo "📋 本轮 IP 数：$(wc -l < /tmp/latest_ips.txt)"
+        COUNT=$(wc -l < /tmp/latest_ips.txt)
+        echo "📋 本轮抓到 IP 数：$COUNT"
 
-        # 已有 IP 列表（用于去重）
+        if [ "$COUNT" -eq 0 ]; then
+          echo "❌ 未抓到任何 IP，终止本次执行"
+          exit 0
+        fi
+
+        # ✅ 始终基于当前 OUT 文件做去重
         touch "$OUT"
         grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}' "$OUT" | sort -u > /tmp/existing_ips.txt
 
@@ -60,7 +65,7 @@ jobs:
 
         while read ip; do
           if grep -qx "$ip" /tmp/existing_ips.txt; then
-            echo "  ⏭ $ip 已存在，跳过"
+            echo "  ⏭ $ip 已存在"
             continue
           fi
 
@@ -86,14 +91,13 @@ jobs:
         done < /tmp/latest_ips.txt
 
         if [ "$NEW_COUNT" -gt 0 ]; then
-          {
-            cat "$OUT"
-            cat "$APPEND_TMP"
-          } > /tmp/ipapi_merge.txt && mv /tmp/ipapi_merge.txt "$OUT"
-          echo "✅ 新增 $NEW_COUNT 条，总计 $(grep -c '^[0-9]' "$OUT") 条"
+          cat "$APPEND_TMP" >> "$OUT"
+          echo "✅ 新增 $NEW_COUNT 条"
         else
           echo "✅ 本轮无新增 IP"
         fi
+
+        echo "📦 当前总 IP 数：$(grep -c '^[0-9]' "$OUT" || echo 0)"
 
     - name: Commit & Push
       run: |
