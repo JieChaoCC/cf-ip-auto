@@ -18,7 +18,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v5
 
-    - name: Determine if Daily Reset
+    - name: Daily Reset Check
       id: reset
       run: |
         HOUR=$(date -u +"%H")
@@ -33,35 +33,27 @@ jobs:
         set -e
         mkdir -p data
 
-        DOMAIN="cs.891122.xyz"
+        LIST_URL="https://ip.164746.xyz/"
+        TRACE_HOST="cs.891122.xyz"
         OUT="data/ipapi.txt"
 
-        # ✅ 每天 00:00 UTC 清空（只在 reset=true 时）
         if [ "${{ steps.reset.outputs.reset }}" = "true" ]; then
-          echo "🌅 每日首次运行，清空 ipapi.txt"
+          echo "🌅 每日首次，清空 ipapi.txt"
           > "$OUT"
         fi
 
-        echo "📡 抓取 $DOMAIN ..."
-        curl -s --connect-timeout 10 --max-time 20 "https://$DOMAIN" \
+        echo "📡 抓取 IP 列表..."
+        curl -s --connect-timeout 15 --max-time 30 "$LIST_URL" \
         | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
         | sort -u > /tmp/latest_ips.txt
 
-        COUNT=$(wc -l < /tmp/latest_ips.txt)
-        echo "📋 本轮抓到 IP 数：$COUNT"
+        echo "📋 本轮 IP 数：$(wc -l < /tmp/latest_ips.txt)"
 
-        if [ "$COUNT" -eq 0 ]; then
-          echo "❌ 未抓到任何 IP，终止本次执行"
-          exit 0
-        fi
-
-        # ✅ 始终基于当前 OUT 文件做去重
         touch "$OUT"
         grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}' "$OUT" | sort -u > /tmp/existing_ips.txt
 
         NEW_COUNT=0
-        APPEND_TMP="/tmp/ipapi_append.txt"
-        > "$APPEND_TMP"
+        > /tmp/ipapi_append.txt
 
         while read ip; do
           if grep -qx "$ip" /tmp/existing_ips.txt; then
@@ -69,35 +61,48 @@ jobs:
             continue
           fi
 
-          echo "  🆕 探测 $ip ..."
-          POP="CF"
+          echo "  🔍 $ip"
+          POP="UNKNOWN"
 
           COL=$(curl -s --connect-timeout 4 --max-time 6 \
-            -H "Host: $DOMAIN" \
+            -H "Host: $TRACE_HOST" \
             "http://$ip/cdn-cgi/trace" 2>/dev/null \
             | grep -i '^colo=' | cut -d'=' -f2)
 
           if [ -z "$COL" ]; then
             COL=$(curl -sk --connect-timeout 4 --max-time 6 \
-              --resolve "$DOMAIN:443:$ip" \
-              "https://$DOMAIN/cdn-cgi/trace" 2>/dev/null \
+              --resolve "$TRACE_HOST:443:$ip" \
+              "https://$TRACE_HOST/cdn-cgi/trace" 2>/dev/null \
               | grep -i '^colo=' | cut -d'=' -f2)
           fi
 
-          [ -n "$COL" ] && POP="CF-$COL"
-          echo "$ip:443#$POP" >> "$APPEND_TMP"
+          [ -n "$COL" ] && POP="$COL"
+          echo "$ip:443#CF-$POP" >> /tmp/ipapi_append.txt
           echo "$ip" >> /tmp/existing_ips.txt
           NEW_COUNT=$((NEW_COUNT+1))
         done < /tmp/latest_ips.txt
 
         if [ "$NEW_COUNT" -gt 0 ]; then
-          cat "$APPEND_TMP" >> "$OUT"
-          echo "✅ 新增 $NEW_COUNT 条"
-        else
-          echo "✅ 本轮无新增 IP"
+          cat /tmp/ipapi_append.txt >> "$OUT"
         fi
 
-        echo "📦 当前总 IP 数：$(grep -c '^[0-9]' "$OUT" || echo 0)"
+        echo "🧮 排序并添加中文地区标注..."
+
+        # ✅ 排序 + 中文地区标注
+        (
+          grep '#CF-LAX' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-LAX/#CF-LAX(美国洛杉矶)/g'
+          grep '#CF-SJC' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-SJC/#CF-SJC(美国圣何塞)/g'
+          grep '#CF-EWR' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-EWR/#CF-EWR(美国纽瓦克)/g'
+          grep '#CF-IAD' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-IAD/#CF-IAD(美国阿什本)/g'
+          grep '#CF-HKG' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-HKG/#CF-HKG(中国香港)/g'
+          grep '#CF-NRT' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-NRT/#CF-NRT(日本东京)/g'
+          grep '#CF-SIN' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-SIN/#CF-SIN(新加坡)/g'
+          grep -v '#CF-\(LAX\|SJC\|EWR\|IAD\|HKG\|NRT\|SIN\)' "$OUT" | sort -t . -k1,1n -k2,2n -k3,3n -k4,4n | sed 's/#CF-UNKNOWN/#CF-UNKNOWN(未知地区)/g'
+        ) > /tmp/ipapi_final.txt
+
+        mv /tmp/ipapi_final.txt "$OUT"
+
+        echo "✅ 完成，当前 IP 数：$(grep -c '^[0-9]' "$OUT")"
 
     - name: Commit & Push
       run: |
