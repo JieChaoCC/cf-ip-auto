@@ -1,8 +1,9 @@
-name: CF IP Daily Update
+name: CF IP Auto Update + PoP
 
 on:
   schedule:
-    - cron: '0 0,8,16 * * *'
+    # 每 2 小时运行一次（UTC 时间）
+    - cron: '0 */2 * * *'
   workflow_dispatch:
 
 permissions:
@@ -16,32 +17,88 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v5   # ✅ 必须 v5 才支持 Node 24
+      uses: actions/checkout@v5
 
-    - name: Fetch & Parse IP
+    - name: Decide Reset or Append
+      id: reset_check
       run: |
+        HOUR=$(date -u +"%H")
+        if [ "$HOUR" = "00" ]; then
+          echo "reset=true" >> $GITHUB_OUTPUT
+        else
+          echo "reset=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Fetch IPs & Detect PoP
+      run: |
+        set -e
         mkdir -p data
 
-        curl -s --connect-timeout 10 --max-time 20 https://ip.164746.xyz/ \
+        DOMAIN="cs.891122.xyz"
+        OUT="data/ipapi.txt"
+
+        # 每天 00:00 UTC 清空历史
+        if [ "${{ steps.reset_check.outputs.reset }}" = "true" ]; then
+          echo "🌅 每日首次运行，清空历史记录"
+          > "$OUT"
+        fi
+
+        echo "📡 抓取 $DOMAIN ..."
+        curl -s --connect-timeout 10 --max-time 20 "https://$DOMAIN" \
         | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
-        | sort -u > data/latest_ips.txt
+        | sort -u > /tmp/latest_ips.txt
 
-        touch data/all_ips.txt
-        cat data/all_ips.txt data/latest_ips.txt \
-        | sort -u > data/tmp_ips.txt && mv data/tmp_ips.txt data/all_ips.txt
+        echo "📋 本轮 IP 数：$(wc -l < /tmp/latest_ips.txt)"
 
-        echo "# Updated: $(date '+%Y-%m-%d %H:%M:%S UTC')" > data/addressesapi.txt
-        echo "# Source: https://ip.164746.xyz/" >> data/addressesapi.txt
-        echo "" >> data/addressesapi.txt
+        # 已有 IP 列表（用于去重）
+        touch "$OUT"
+        grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}' "$OUT" | sort -u > /tmp/existing_ips.txt
+
+        NEW_COUNT=0
+        APPEND_TMP="/tmp/ipapi_append.txt"
+        > "$APPEND_TMP"
 
         while read ip; do
-          echo "$ip:443#CF" >> data/addressesapi.txt
-        done < data/all_ips.txt
+          if grep -qx "$ip" /tmp/existing_ips.txt; then
+            echo "  ⏭ $ip 已存在，跳过"
+            continue
+          fi
+
+          echo "  🆕 探测 $ip ..."
+          POP="CF"
+
+          COL=$(curl -s --connect-timeout 4 --max-time 6 \
+            -H "Host: $DOMAIN" \
+            "http://$ip/cdn-cgi/trace" 2>/dev/null \
+            | grep -i '^colo=' | cut -d'=' -f2)
+
+          if [ -z "$COL" ]; then
+            COL=$(curl -sk --connect-timeout 4 --max-time 6 \
+              --resolve "$DOMAIN:443:$ip" \
+              "https://$DOMAIN/cdn-cgi/trace" 2>/dev/null \
+              | grep -i '^colo=' | cut -d'=' -f2)
+          fi
+
+          [ -n "$COL" ] && POP="CF-$COL"
+          echo "$ip:443#$POP" >> "$APPEND_TMP"
+          echo "$ip" >> /tmp/existing_ips.txt
+          NEW_COUNT=$((NEW_COUNT+1))
+        done < /tmp/latest_ips.txt
+
+        if [ "$NEW_COUNT" -gt 0 ]; then
+          {
+            cat "$OUT"
+            cat "$APPEND_TMP"
+          } > /tmp/ipapi_merge.txt && mv /tmp/ipapi_merge.txt "$OUT"
+          echo "✅ 新增 $NEW_COUNT 条，总计 $(grep -c '^[0-9]' "$OUT") 条"
+        else
+          echo "✅ 本轮无新增 IP"
+        fi
 
     - name: Commit & Push
       run: |
         git config user.name "cf-bot"
         git config user.email "bot@localhost"
         git add data/
-        git diff --cached --quiet || git commit -m "auto: update cf ip list"
+        git diff --cached --quiet || git commit -m "auto: update ipapi.txt"
         git push
