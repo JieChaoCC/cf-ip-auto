@@ -1,4 +1,4 @@
-name: CF IP Auto Update (Top 5 per Country)
+name: CF IP Auto Update (Top 5 per Country - Fixed)
 
 on:
   schedule:
@@ -88,7 +88,7 @@ jobs:
 
             awk -v i="$ip" '$1!=i' "$FC" > /tmp/_fc.txt && mv /tmp/_fc.txt "$FC"
 
-            # 提取国家
+            # 提取国家（兼容多种格式）
             country=$(echo "$line" | sed -E 's/.*#//' | sed 's/([0-9]*ms)//g')
             TMP_KEEP="${TMP_KEEP}${ip}:${best_port}#${country}#${best_time}"$'\n'
             echo "  ✅ $ip 最优端口：$best_port (${best_time}ms)"
@@ -145,20 +145,16 @@ jobs:
 
           echo "  🆕 归属查询：$ip"
           
-          # ✅ 双重归属查询（解决未知地区）
+          # 双重归属查询
           COUNTRY=""
-          
-          # 1. 先试 iplark.com
           COUNTRY=$(curl -s --connect-timeout 8 --max-time 10 "https://iplark.com/?q=$ip" \
             | grep -oE '国家[:：]\s*[^\s<]+' | head -1 | sed -E 's/国家[:：]\s*//' | tr -d ' ')
           
-          # 2. 如果失败，用 ip-api.com（更稳定）
           if [ -z "$COUNTRY" ] || [ "$COUNTRY" = "未知地区" ]; then
             COUNTRY=$(curl -s --connect-timeout 8 --max-time 10 "http://ip-api.com/json/$ip?fields=country" \
               | grep -oE '"country":"[^"]+"' | cut -d'"' -f4)
           fi
           
-          # 3. 如果还是失败，用 ipwhois.io
           if [ -z "$COUNTRY" ]; then
             COUNTRY=$(curl -s --connect-timeout 8 --max-time 10 "https://ipwhois.app/json/$ip" \
               | grep -oE '"country":"[^"]+"' | cut -d'"' -f4)
@@ -191,26 +187,25 @@ jobs:
         echo "✏️  追加新 IP：$NEW"
 
         # ==========================================================
-        # C. 每个国家只保留延迟最低的前 5 个
+        # C. 每个国家只保留延迟最低的前 5 个（修复版）
         # ==========================================================
         echo "🎯 每个国家只保留延迟最低的前 5 个..."
         
-        # 创建临时文件存储处理后的数据
+        # 创建临时文件
         > /tmp/top5_per_country.txt
         
-        # 定义国家优先级顺序
-        COUNTRIES=("中国" "中国香港" "中国台湾" "中国澳门" "美国" "日本" "韩国" "新加坡" "德国" "法国" "英国")
+        # 动态获取所有国家（从现有数据中）
+        countries=$(grep -oE '#[^#]+#[0-9]+$' "$OUT" | sed -E 's/#([^#]+)#[0-9]+$/\1/' | sort -u)
         
-        for country in "${COUNTRIES[@]}"; do
+        echo "📊 发现国家：$countries"
+        
+        # 对每个国家取前5个
+        for country in $countries; do
           echo "  处理国家：$country"
           grep "#${country}#" "$OUT" | sort -t'#' -k3 -n | head -5 >> /tmp/top5_per_country.txt
         done
         
-        # 处理其他国家（不在预定义列表中的）
-        grep -v -E "#(中国|中国香港|中国台湾|中国澳门|美国|日本|韩国|新加坡|德国|法国|英国)#" "$OUT" \
-        | sort -t'#' -k3 -n | head -5 >> /tmp/top5_per_country.txt
-        
-        # 如果没有任何匹配，保留原始文件
+        # 如果文件不为空，替换原文件
         if [ -s /tmp/top5_per_country.txt ]; then
           mv /tmp/top5_per_country.txt "$OUT"
         fi
@@ -220,6 +215,7 @@ jobs:
         # ==========================================================
         echo "🧮 最终排序..."
         
+        # 按国家优先级排序
         (
           grep -E '#(中国|中国香港|中国台湾|中国澳门)#' "$OUT" | sort -t'#' -k3 -n
           grep -E '#美国#' "$OUT" | sort -t'#' -k3 -n
